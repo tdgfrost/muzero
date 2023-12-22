@@ -2,13 +2,13 @@ import copy
 import time
 
 import numpy
-import ray
+# import ray
 import torch
 
 import models
 
 
-@ray.remote
+# @ray.remote
 class Trainer:
     """
     Class which run in a dedicated thread to train a neural network and save it
@@ -25,12 +25,12 @@ class Trainer:
         # Initialize the network
         self.model = models.MuZeroNetwork(self.config)
         self.model.set_weights(copy.deepcopy(initial_checkpoint["weights"]))
-        self.model.to(torch.device("cuda" if self.config.train_on_gpu else "cpu"))
+        self.model.to(torch.device(("mps" if torch.backends.mps.is_available() else "cuda") if self.config.train_on_gpu else "cpu"))
         self.model.train()
 
         self.training_step = initial_checkpoint["training_step"]
 
-        if "cuda" not in str(next(self.model.parameters()).device):
+        if str(next(self.model.parameters()).device) not in ["mps", "cuda"]:
             print("You are not training on GPU.\n")
 
         # Initialize the optimizer
@@ -60,16 +60,14 @@ class Trainer:
 
     def continuous_update_weights(self, replay_buffer, shared_storage):
         # Wait for the replay buffer to be filled
-        while ray.get(shared_storage.get_info.remote("num_played_games")) < 1:
+        while shared_storage.get_info("num_played_games") < 1:
             time.sleep(0.1)
 
-        next_batch = replay_buffer.get_batch.remote()
+        next_batch = replay_buffer.get_batch()
         # Training loop
-        while self.training_step < self.config.training_steps and not ray.get(
-            shared_storage.get_info.remote("terminate")
-        ):
-            index_batch, batch = ray.get(next_batch)
-            next_batch = replay_buffer.get_batch.remote()
+        while self.training_step < self.config.training_steps and not shared_storage.get_info("terminate"):
+            index_batch, batch = next_batch
+            next_batch = replay_buffer.get_batch()
             self.update_lr()
             (
                 priorities,
@@ -81,11 +79,11 @@ class Trainer:
 
             if self.config.PER:
                 # Save new priorities in the replay buffer (See https://arxiv.org/abs/1803.00933)
-                replay_buffer.update_priorities.remote(priorities, index_batch)
+                replay_buffer.update_priorities(priorities, index_batch)
 
             # Save to the shared storage
             if self.training_step % self.config.checkpoint_interval == 0:
-                shared_storage.set_info.remote(
+                shared_storage.set_info(
                     {
                         "weights": copy.deepcopy(self.model.get_weights()),
                         "optimizer_state": copy.deepcopy(
@@ -94,8 +92,8 @@ class Trainer:
                     }
                 )
                 if self.config.save_model:
-                    shared_storage.save_checkpoint.remote()
-            shared_storage.set_info.remote(
+                    shared_storage.save_checkpoint()
+            shared_storage.set_info(
                 {
                     "training_step": self.training_step,
                     "lr": self.optimizer.param_groups[0]["lr"],
@@ -113,11 +111,11 @@ class Trainer:
                 while (
                     self.training_step
                     / max(
-                        1, ray.get(shared_storage.get_info.remote("num_played_steps"))
+                        1, shared_storage.get_info("num_played_steps")
                     )
                     > self.config.ratio
                     and self.training_step < self.config.training_steps
-                    and not ray.get(shared_storage.get_info.remote("terminate"))
+                    and not shared_storage.get_info("terminate")
                 ):
                     time.sleep(0.5)
 

@@ -2,13 +2,13 @@ import math
 import time
 
 import numpy
-import ray
+# import ray
 import torch
 
 import models
 
 
-@ray.remote
+# @ray.remote
 class SelfPlay:
     """
     Class which run in a dedicated thread to play games and save them to the replay-buffer.
@@ -25,23 +25,21 @@ class SelfPlay:
         # Initialize the network
         self.model = models.MuZeroNetwork(self.config)
         self.model.set_weights(initial_checkpoint["weights"])
-        self.model.to(torch.device("cuda" if self.config.selfplay_on_gpu else "cpu"))
+        self.model.to(torch.device(("mps" if torch.backends.mps.is_available() else "cuda") if self.config.selfplay_on_gpu else "cpu"))
         self.model.eval()
 
     def continuous_self_play(self, shared_storage, replay_buffer, test_mode=False):
-        while ray.get(
-            shared_storage.get_info.remote("training_step")
-        ) < self.config.training_steps and not ray.get(
-            shared_storage.get_info.remote("terminate")
+        while (
+            shared_storage.get_info("training_step")
+        ) < self.config.training_steps and not (
+            shared_storage.get_info("terminate")
         ):
-            self.model.set_weights(ray.get(shared_storage.get_info.remote("weights")))
+            self.model.set_weights(shared_storage.get_info("weights"))
 
             if not test_mode:
                 game_history = self.play_game(
                     self.config.visit_softmax_temperature_fn(
-                        trained_steps=ray.get(
-                            shared_storage.get_info.remote("training_step")
-                        )
+                        trained_steps=shared_storage.get_info("training_step")
                     ),
                     self.config.temperature_threshold,
                     False,
@@ -49,7 +47,7 @@ class SelfPlay:
                     0,
                 )
 
-                replay_buffer.save_game.remote(game_history, shared_storage)
+                replay_buffer.save_game(game_history, shared_storage)
 
             else:
                 # Take the best action (no exploration) in test mode
@@ -62,7 +60,7 @@ class SelfPlay:
                 )
 
                 # Save to the shared storage
-                shared_storage.set_info.remote(
+                shared_storage.set_info(
                     {
                         "episode_length": len(game_history.action_history) - 1,
                         "total_reward": sum(game_history.reward_history),
@@ -72,7 +70,7 @@ class SelfPlay:
                     }
                 )
                 if 1 < len(self.config.players):
-                    shared_storage.set_info.remote(
+                    shared_storage.set_info(
                         {
                             "muzero_reward": sum(
                                 reward
@@ -94,14 +92,14 @@ class SelfPlay:
                 time.sleep(self.config.self_play_delay)
             if not test_mode and self.config.ratio:
                 while (
-                    ray.get(shared_storage.get_info.remote("training_step"))
+                    shared_storage.get_info("training_step")
                     / max(
-                        1, ray.get(shared_storage.get_info.remote("num_played_steps"))
+                        1, shared_storage.get_info("num_played_steps")
                     )
                     < self.config.ratio
-                    and ray.get(shared_storage.get_info.remote("training_step"))
+                    and shared_storage.get_info("training_step")
                     < self.config.training_steps
-                    and not ray.get(shared_storage.get_info.remote("terminate"))
+                    and not shared_storage.get_info("terminate")
                 ):
                     time.sleep(0.5)
 
@@ -229,7 +227,7 @@ class SelfPlay:
         visit_counts = numpy.array(
             [child.visit_count for child in node.children.values()], dtype="int32"
         )
-        actions = [action for action in node.children.keys()]
+        actions = list(node.children.keys())
         if temperature == 0:
             action = actions[numpy.argmax(visit_counts)]
         elif temperature == float("inf"):
@@ -364,15 +362,15 @@ class MCTS:
         """
         Select the child with the highest UCB score.
         """
-        max_ucb = max(
-            self.ucb_score(node, child, min_max_stats)
-            for action, child in node.children.items()
-        )
+        ucb_scores = [self.ucb_score(node, child, min_max_stats)
+                      for action, child in node.children.items()]
+
+        max_ucb = max(ucb_scores)
         action = numpy.random.choice(
             [
                 action
-                for action, child in node.children.items()
-                if self.ucb_score(node, child, min_max_stats) == max_ucb
+                for action, ucb_score in zip(node.children.keys(), ucb_scores)
+                if ucb_score == max_ucb
             ]
         )
         return action, node.children[action]
